@@ -1,0 +1,529 @@
+// Anchor program for Drift DLOB with DROC and Resting Liquidity Vault
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, TokenAccount, Transfer};
+
+// Program ID (placeholder, to be replaced)
+declare_id!("DriftDLOBProgram11111111111111111111111111111111");
+
+// Program accounts
+#[account]
+pub struct Market {
+ pub market_id: u64, // Unique market identifier (e.g., SOL/USDC)
+ pub base_asset: Pubkey, // Base asset (e.g., SOL, JitoSOL)
+ pub quote_asset: Pubkey, // Quote asset (e.g., USDC)
+ pub oracle: Pubkey, // Pyth oracle for price validation
+}
+
+#[account]
+pub struct RestingOrderCommitment {
+ pub maker: Pubkey, // Maker’s public key
+ pub market: Pubkey, // Market for the order
+ pub price: u64, // Price in ticks (e.g., 1000 = $10.00)
+ pub size: u64, // Size in base asset units
+ pub expiry_block: u64, // Block height when order expires
+ pub collateral_locked: u64, // Locked collateral (e.g., 0.01 SOL or JitoSOL)
+ pub jit_enabled: bool, // True for JIT confirmation
+ pub commitment_id: u64, // Unique order ID
+ pub side: Side, // Bid or Ask
+}
+
+#[account]
+pub struct RewardAccount {
+ pub maker: Pubkey, // Maker’s public key
+ pub balance: u64, // Accumulated DRIFT rewards
+}
+
+#[account]
+pub struct RestingLiquidityVault {
+ pub vault_id: u64, // Unique vault identifier
+ pub total_deposits: u64, // Total deposited assets (e.g., SOL, JitoSOL)
+ pub depositors: Vec<Pubkey>,// List of depositor public keys
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub enum Side {
+ Bid,
+ Ask,
+}
+
+// Program logic
+#[program]
+pub mod drift_dlob {
+ use super::*;
+
+ // Initialize a market
+ pub fn initialize_market(
+ ctx: Context<InitializeMarket>,
+ market_id: u64,
+ base_asset: Pubkey,
+ quote_asset: Pubkey,
+ oracle: Pubkey,
+ ) -> Result<()> {
+ let market = &mut ctx.accounts.market;
+ market.market_id = market_id;
+ market.base_asset = base_asset;
+ market.quote_asset = quote_asset;
+ market.oracle = oracle;
+ Ok(())
+ }
+
+ // Initialize Resting Liquidity Vault
+ pub fn initialize_vault(
+ ctx: Context<InitializeVault>,
+ vault_id: u64,
+ ) -> Result<()> {
+ let vault = &mut ctx.accounts.vault;
+ vault.vault_id = vault_id;
+ vault.total_deposits = 0;
+ vault.depositors = vec![];
+ Ok(())
+ }
+
+ // Deposit into Resting Liquidity Vault
+ pub fn deposit_to_vault(
+ ctx: Context<DepositToVault>,
+ amount: u64,
+ ) -> Result<()> {
+ let vault = &mut ctx.accounts.vault;
+ let depositor = ctx.accounts.depositor.key();
+
+ token::transfer(
+ CpiContext::new(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.depositor_account.to_account_info(),
+ to: ctx.accounts.vault_account.to_account_info(),
+ authority: ctx.accounts.depositor.to_account_info(),
+ },
+ ),
+ amount,
+ )?;
+
+ vault.total_deposits += amount;
+ if !vault.depositors.contains(&depositor) {
+ vault.depositors.push(depositor);
+ }
+ emit!(VaultDeposit { depositor, amount });
+ Ok(())
+ }
+
+ // Submit a DROC order
+ pub fn submit_droc(
+ ctx: Context<SubmitDROC>,
+ market_id: u64,
+ price: u64,
+ size: u64,
+ expiry_duration: u64,
+ collateral_amount: u64,
+ jit_enabled: bool,
+ side: Side,
+ ) -> Result<()> {
+ let market = &ctx.accounts.market;
+ let commitment = &mut ctx.accounts.commitment;
+ let clock = Clock::get()?;
+
+ // Validate inputs
+ if collateral_amount < MIN_COLLATERAL {
+ return Err(ErrorCode::InsufficientCollateral.into());
+ }
+ if size == 0 {
+ return Err(ErrorCode::InvalidSize.into());
+ }
+ let oracle_price = get_pyth_price(&market.oracle)?;
+ let spread_limit = oracle_price / 100; // 1% deviation
+ if price < oracle_price - spread_limit || price > oracle_price + spread_limit {
+ return Err(ErrorCode::InvalidPrice.into());
+ }
+
+ // Lock collateral from vault or maker
+ token::transfer(
+ CpiContext::new_with_signer(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.maker_collateral.to_account_info(),
+ to: ctx.accounts.vault.to_account_info(),
+ authority: ctx.accounts.maker.to_account_info(),
+ },
+ &[&[
+ b"resting_liquidity_vault",
+ ctx.accounts.vault.vault_id.to_le_bytes().as_ref(),
+ &[ctx.accounts.vault.bump],
+ ]],
+ ),
+ collateral_amount,
+ )?;
+
+ commitment.maker = ctx.accounts.maker.key();
+ commitment.market = market.key();
+ commitment.price = price;
+ commitment.size = size;
+ commitment.expiry_block = clock.slot + expiry_duration;
+ commitment.collateral_locked = collateral_amount;
+ commitment.jit_enabled = jit_enabled;
+ commitment.commitment_id = generate_unique_id(&clock);
+ commitment.side = side;
+
+ emit!(DROCSubmitted {
+ commitment_id: commitment.commitment_id,
+ market_id,
+ price,
+ size,
+ side,
+ expiry_block: commitment.expiry_block,
+ });
+
+ Ok(())
+ }
+
+ // Match a taker order against a DROC
+ pub fn match_droc(
+ ctx: Context<MatchDROC>,
+ commitment_id: u64,
+ taker_size: u64,
+ ) -> Result<()> {
+ let commitment = &mut ctx.accounts.commitment;
+ let clock = Clock::get()?;
+
+ if commitment.expiry_block <= clock.slot {
+ return Err(ErrorCode::OrderExpired.into());
+ }
+ if taker_size > commitment.size {
+ return Err(ErrorCode::SizeTooLarge.into());
+ }
+
+ if commitment.jit_enabled {
+ let jit_window = clock.unix_timestamp + JIT_WINDOW_SECONDS;
+ emit!(JITConfirmationRequested {
+ commitment_id,
+ taker: ctx.accounts.taker.key(),
+ taker_size,
+ deadline: jit_window,
+ });
+ } else {
+ update_commitment(&mut ctx.accounts.commitment, taker_size)?;
+ if commitment.size == 0 {
+ token::transfer(
+ CpiContext::new(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.vault.to_account_info(),
+ to: ctx.accounts.maker_collateral.to_account_info(),
+ authority: ctx.accounts.program_authority.to_account_info(),
+ },
+ ),
+ commitment.collateral_locked,
+ )?;
+ commitment.close(ctx.accounts.program_authority.to_account_info())?;
+ }
+ }
+
+ Ok(())
+ }
+
+ // Maker confirms or adjusts JIT fill
+ pub fn jit_confirm(
+ ctx: Context<JITConfirm>,
+ commitment_id: u64,
+ adjusted_price: Option<u64>,
+ accept: bool,
+ ) -> Result<()> {
+ let commitment = &mut ctx.accounts.commitment;
+ let clock = Clock::get()?;
+
+ if commitment.expiry_block <= clock.slot {
+ return Err(ErrorCode::OrderExpired.into());
+ }
+ if !commitment.jit_enabled {
+ return Err(ErrorCode::JITNotEnabled.into());
+ }
+
+ if accept {
+ let final_price = adjusted_price.unwrap_or(commitment.price);
+ let oracle_price = get_pyth_price(&ctx.accounts.market.oracle)?;
+ let spread_limit = oracle_price / 100;
+ if final_price < oracle_price - spread_limit || final_price > oracle_price + spread_limit {
+ return Err(ErrorCode::InvalidPrice.into());
+ }
+ update_commitment(&mut ctx.accounts.commitment, commitment.size)?;
+ if commitment.size == 0 {
+ token::transfer(
+ CpiContext::new(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.vault.to_account_info(),
+ to: ctx.accounts.maker_collateral.to_account_info(),
+ authority: ctx.accounts.program_authority.to_account_info(),
+ },
+ ),
+ commitment.collateral_locked,
+ )?;
+ commitment.close(ctx.accounts.program_authority.to_account_info())?;
+ }
+ } else {
+ emit!(JITRejected { commitment_id });
+ }
+
+ Ok(())
+ }
+
+ // Prune expired orders
+ pub fn prune_expired(ctx: Context<PruneExpired>, commitment_ids: Vec<u64>) -> Result<()> {
+ let clock = Clock::get()?;
+ let mut i = 0;
+ while i < ctx.remaining_accounts.len() {
+ let commitment_info = &ctx.remaining_accounts[i];
+ let maker_collateral_info = &ctx.remaining_accounts[i + 1];
+ let mut commitment = Account::<RestingOrderCommitment>::try_from(commitment_info)?;
+ let maker_collateral = Account::<TokenAccount>::try_from(maker_collateral_info)?;
+ if commitment.expiry_block <= clock.slot {
+ token::transfer(
+ CpiContext::new(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.vault.to_account_info(),
+ to: maker_collateral.to_account_info(),
+ authority: ctx.accounts.program_authority.to_account_info(),
+ },
+ ),
+ commitment.collateral_locked,
+ )?;
+ commitment.close(ctx.accounts.program_authority.to_account_info())?;
+ }
+ i += 2;
+ }
+ Ok(())
+ }
+
+ // Distribute rewards
+ pub fn distribute_rewards(
+ ctx: Context<DistributeRewards>,
+ commitment_id: u64,
+ ) -> Result<()> {
+ let commitment = &ctx.accounts.commitment;
+ let reward_account = &mut ctx.accounts.reward_account;
+ let market = &ctx.accounts.market;
+
+ let reward = calculate_reward(
+ commitment.price,
+ commitment.size,
+ commitment.expiry_block,
+ market.oracle,
+ )?;
+ reward_account.balance += reward;
+
+ token::transfer(
+ CpiContext::new(
+ ctx.accounts.token_program.to_account_info(),
+ Transfer {
+ from: ctx.accounts.drift_vault.to_account_info(),
+ to: ctx.accounts.maker_reward_wallet.to_account_info(),
+ authority: ctx.accounts.program_authority.to_account_info(),
+ },
+ ),
+ reward,
+ )?;
+
+ emit!(RewardDistributed {
+ maker: commitment.maker,
+ reward,
+ commitment_id,
+ });
+
+ Ok(())
+ }
+}
+
+// Context structs
+#[derive(Accounts)]
+pub struct InitializeMarket<'info> {
+ #[account(init, payer = authority, space = 200)]
+ pub market: Account<'info, Market>,
+ #[account(mut)]
+ pub authority: Signer<'info>,
+ pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeVault<'info> {
+ #[account(init, payer = authority, space = 200)]
+ pub vault: Account<'info, RestingLiquidityVault>,
+ #[account(mut)]
+ pub authority: Signer<'info>,
+ pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DepositToVault<'info> {
+ #[account(mut)]
+ pub depositor: Signer<'info>,
+ #[account(mut)]
+ pub vault: Account<'info, RestingLiquidityVault>,
+ #[account(mut)]
+ pub depositor_account: Account<'info, TokenAccount>,
+ #[account(mut)]
+ pub vault_account: Account<'info, TokenAccount>,
+ pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitDROC<'info> {
+ #[account(mut)]
+ pub maker: Signer<'info>,
+ #[account(mut)]
+ pub market: Account<'info, Market>,
+ #[account(init, payer = maker, space = 200)]
+ pub commitment: Account<'info, RestingOrderCommitment>,
+ #[account(mut)]
+ pub maker_collateral: Account<'info, TokenAccount>,
+ #[account(mut)]
+ pub vault: Account<'info, TokenAccount>,
+ pub token_program: Program<'info, Token>,
+ pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MatchDROC<'info> {
+ pub taker: Signer<'info>,
+ pub maker: AccountInfo<'info>,
+ #[account(mut)]
+ pub market: Account<'info, Market>,
+ #[account(mut)]
+ pub commitment: Account<'info, RestingOrderCommitment>,
+ #[account(mut)]
+ pub vault: Account<'info, TokenAccount>,
+ #[account(mut)]
+ pub maker_collateral: Account<'info, TokenAccount>,
+ pub program_authority: AccountInfo<'info>,
+ pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct JITConfirm<'info> {
+ pub maker: Signer<'info>,
+ pub taker: AccountInfo<'info>,
+ #[account(mut)]
+ pub market: Account<'info, Market>,
+ #[account(mut)]
+ pub commitment: Account<'info, RestingOrderCommitment>,
+ #[account(mut)]
+ pub vault: Account<'info, TokenAccount>,
+ #[account(mut)]
+ pub maker_collateral: Account<'info, TokenAccount>,
+ pub program_authority: AccountInfo<'info>,
+ pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct PruneExpired<'info> {
+ #[account(mut)]
+ pub vault: Account<'info, TokenAccount>,
+ pub program_authority: AccountInfo<'info>,
+ pub token_program: Program<'info, Token>,
+ pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DistributeRewards<'info> {
+ pub maker: AccountInfo<'info>,
+ #[account(mut)]
+ pub reward_account: Account<'info, RewardAccount>,
+ #[account(mut)]
+ pub commitment: Account<'info, RestingOrderCommitment>,
+ #[account(mut)]
+ pub market: Account<'info, Market>,
+ #[account(mut)]
+ pub drift_vault: Account<'info, TokenAccount>,
+ #[account(mut)]
+ pub maker_reward_wallet: Account<'info, TokenAccount>,
+ pub program_authority: AccountInfo<'info>,
+ pub token_program: Program<'info, Token>,
+}
+
+// Helper functions
+fn calculate_reward(
+ price: u64,
+ size: u64,
+ expiry_block: u64,
+ oracle: Pubkey,
+) -> Result<u64> {
+ let oracle_price = get_pyth_price(&oracle)?; // Placeholder: Fetch from Pyth
+ let spread = (price as i64 - oracle_price as i64).abs() as u64;
+ let duration = expiry_block.saturating_sub(Clock::get()?.slot);
+ let base_reward = 100; // DRIFT tokens per block
+ Ok(base_reward * duration * (1_000_000 - spread) / 1_000_000)
+}
+
+fn get_pyth_price(_oracle: &Pubkey) -> Result<u64> {
+ // Placeholder: Implement Pyth price fetch
+ Ok(1000)
+}
+
+fn update_commitment(
+ commitment: &mut Account<RestingOrderCommitment>,
+ filled_size: u64,
+) -> Result<()> {
+ commitment.size = commitment.size.saturating_sub(filled_size);
+ Ok(())
+}
+
+fn generate_unique_id(clock: &Clock) -> u64 {
+ (clock.slot << 32) | (clock.unix_timestamp as u64)
+}
+
+// Constants
+const MIN_COLLATERAL: u64 = 10_000_000; // 0.01 SOL in lamports
+const JIT_WINDOW_SECONDS: i64 = 100; // 0.1s in milliseconds
+
+// Errors
+#[error_code]
+pub enum ErrorCode {
+ #[msg("Insufficient collateral locked")]
+ InsufficientCollateral,
+ #[msg("Invalid order size")]
+ InvalidSize,
+ #[msg("Order expired")]
+ OrderExpired,
+ #[msg("Size too large")]
+ SizeTooLarge,
+ #[msg("JIT not enabled")]
+ JITNotEnabled,
+ #[msg("Invalid price")]
+ InvalidPrice,
+}
+
+// Events
+#[event]
+pub struct DROCSubmitted {
+ pub commitment_id: u64,
+ pub market_id: u64,
+ pub price: u64,
+ pub size: u64,
+ pub side: Side,
+ pub expiry_block: u64,
+}
+
+#[event]
+pub struct JITConfirmationRequested {
+ pub commitment_id: u64,
+ pub taker: Pubkey,
+ pub taker_size: u64,
+ pub deadline: i64,
+}
+
+#[event]
+pub struct JITRejected {
+ pub commitment_id: u64,
+}
+
+#[event]
+pub struct RewardDistributed {
+ pub maker: Pubkey,
+ pub reward: u64,
+ pub commitment_id: u64,
+}
+
+#[event]
+pub struct VaultDeposit {
+ pub depositor: Pubkey,
+ pub amount: u64,
+}
